@@ -41,12 +41,12 @@ jobs:
     env:
       CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      ROOT_DOMAIN: ${{ inputs.root_domain }}
-      FRONTEND_SUBDOMAIN: ${{ inputs.frontend_subdomain }}
-      BACKEND_SUBDOMAIN: ${{ inputs.backend_subdomain }}
-      WORKER_NAME: ${{ inputs.worker_name }}
-      PAGES_PROJECT: ${{ inputs.pages_project }}
-      D1_NAME: ${{ inputs.d1_name }}
+      ROOT_DOMAIN: ${{ github.event.inputs.root_domain || 'simo37.site' }}
+      FRONTEND_SUBDOMAIN: ${{ github.event.inputs.frontend_subdomain || 'mail' }}
+      BACKEND_SUBDOMAIN: ${{ github.event.inputs.backend_subdomain || 'temp-email-api' }}
+      WORKER_NAME: ${{ github.event.inputs.worker_name || 'simo37-temp-email-api' }}
+      PAGES_PROJECT: ${{ github.event.inputs.pages_project || 'simo37-temp-email' }}
+      D1_NAME: ${{ github.event.inputs.d1_name || 'simo37-temp-email' }}
       JWT_SECRET: ${{ secrets.BOOTSTRAP_JWT_SECRET }}
     steps:
       - uses: actions/checkout@v6
