@@ -132,8 +132,6 @@ jobs:
           ENABLE_USER_CREATE_EMAIL = true
           ENABLE_USER_DELETE_EMAIL = true
           FRONTEND_URL = "https://${{ steps.meta.outputs.frontend_domain }}"
-          E2E_TEST_MODE = true
-          ADMIN_PASSWORDS = ["oc-test-${GITHUB_RUN_ID}"]
           
           [[d1_databases]]
           binding = "DB"
