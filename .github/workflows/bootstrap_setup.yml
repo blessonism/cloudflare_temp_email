@@ -1,0 +1,205 @@
+name: Bootstrap Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      root_domain:
+        description: Root domain hosted on Cloudflare
+        required: true
+        default: simo37.site
+      frontend_subdomain:
+        description: Frontend subdomain
+        required: true
+        default: mail
+      backend_subdomain:
+        description: Backend subdomain
+        required: true
+        default: temp-email-api
+      worker_name:
+        description: Worker service name
+        required: true
+        default: simo37-temp-email-api
+      pages_project:
+        description: Pages project name
+        required: true
+        default: simo37-temp-email
+      d1_name:
+        description: D1 database name
+        required: true
+        default: simo37-temp-email
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      ROOT_DOMAIN: ${{ inputs.root_domain }}
+      FRONTEND_SUBDOMAIN: ${{ inputs.frontend_subdomain }}
+      BACKEND_SUBDOMAIN: ${{ inputs.backend_subdomain }}
+      WORKER_NAME: ${{ inputs.worker_name }}
+      PAGES_PROJECT: ${{ inputs.pages_project }}
+      D1_NAME: ${{ inputs.d1_name }}
+      JWT_SECRET: ${{ secrets.BOOTSTRAP_JWT_SECRET }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Resolve zone and D1
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          api() {
+            curl -fsSL -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" "$@"
+          }
+          zone_json=$(api "https://api.cloudflare.com/client/v4/zones?name=$ROOT_DOMAIN")
+          zone_id=$(echo "$zone_json" | jq -r '.result[0].id // empty')
+          if [ -z "$zone_id" ]; then
+            echo "Zone not found for $ROOT_DOMAIN"
+            echo "$zone_json"
+            exit 1
+          fi
+          db_list=$(api "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database")
+          db_id=$(echo "$db_list" | jq -r --arg name "$D1_NAME" '.result[]? | select(.name==$name) | .uuid' | head -n1)
+          if [ -z "$db_id" ]; then
+            db_create=$(curl -fsSL -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"$D1_NAME\"}")
+            db_id=$(echo "$db_create" | jq -r '.result.uuid')
+          fi
+          frontend_domain="$FRONTEND_SUBDOMAIN.$ROOT_DOMAIN"
+          backend_domain="$BACKEND_SUBDOMAIN.$ROOT_DOMAIN"
+          echo "zone_id=$zone_id" >> "$GITHUB_OUTPUT"
+          echo "db_id=$db_id" >> "$GITHUB_OUTPUT"
+          echo "frontend_domain=$frontend_domain" >> "$GITHUB_OUTPUT"
+          echo "backend_domain=$backend_domain" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure Pages project
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /tmp/pages.json -w '%{http_code}' \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/pages/projects/$PAGES_PROJECT")
+          if [ "$status" = "404" ]; then
+            curl -fsSL -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/pages/projects" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"$PAGES_PROJECT\",\"production_branch\":\"production\"}" >/tmp/pages-create.json
+            cat /tmp/pages-create.json | jq .
+          else
+            cat /tmp/pages.json | jq '{success,result:{name:.result.name,subdomain:.result.subdomain}}'
+          fi
+
+      - name: Build backend config
+        shell: bash
+        run: |
+          cat > worker/wrangler.toml <<EOF
+name = "$WORKER_NAME"
+main = "src/worker.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = [ "nodejs_compat" ]
+keep_vars = true
+routes = [
+  { pattern = "${{ steps.meta.outputs.backend_domain }}", custom_domain = true },
+]
+
+[vars]
+PREFIX = "tmp"
+DEFAULT_DOMAINS = ["$ROOT_DOMAIN"]
+DOMAINS = ["$ROOT_DOMAIN"]
+JWT_SECRET = "$JWT_SECRET"
+ENABLE_USER_CREATE_EMAIL = true
+ENABLE_USER_DELETE_EMAIL = true
+FRONTEND_URL = "https://${{ steps.meta.outputs.frontend_domain }}"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "$D1_NAME"
+database_id = "${{ steps.meta.outputs.db_id }}"
+EOF
+          sed -n '1,120p' worker/wrangler.toml | sed 's/JWT_SECRET = ".*"/JWT_SECRET = "***"/'
+
+      - name: Init D1 schema
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          cd worker
+          pnpm install --no-frozen-lockfile
+          pnpm exec wrangler d1 execute "$D1_NAME" --file=../db/schema.sql --remote
+
+      - name: Deploy backend
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          cd worker
+          pnpm install --no-frozen-lockfile
+          pnpm run deploy
+
+      - name: Build frontend env
+        shell: bash
+        run: |
+          cat > frontend/.env.prod <<EOF
+VITE_API_BASE=https://${{ steps.meta.outputs.backend_domain }}
+VITE_CF_WEB_ANALY_TOKEN=
+VITE_IS_TELEGRAM=false
+EOF
+          cat frontend/.env.prod
+
+      - name: Deploy frontend
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          cd frontend
+          pnpm install --no-frozen-lockfile
+          pnpm run deploy --project-name="$PAGES_PROJECT"
+
+      - name: Ensure Pages custom domain
+        shell: bash
+        run: |
+          set -euo pipefail
+          frontend_domain="${{ steps.meta.outputs.frontend_domain }}"
+          domains=$(curl -fsSL -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/pages/projects/$PAGES_PROJECT/domains")
+          if ! echo "$domains" | jq -e --arg d "$frontend_domain" '.result[]? | select(.name==$d)' >/dev/null; then
+            curl -fsSL -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/pages/projects/$PAGES_PROJECT/domains" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"$frontend_domain\"}" | jq .
+          else
+            echo "$domains" | jq --arg d "$frontend_domain" '.result[]? | select(.name==$d)'
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## Bootstrap Result"
+            echo "- Root domain: $ROOT_DOMAIN"
+            echo "- Worker name: $WORKER_NAME"
+            echo "- Backend domain: https://${{ steps.meta.outputs.backend_domain }}"
+            echo "- Pages project: $PAGES_PROJECT"
+            echo "- Frontend domain: https://${{ steps.meta.outputs.frontend_domain }}"
+            echo "- D1 name: $D1_NAME"
+            echo "- D1 id: ${{ steps.meta.outputs.db_id }}"
+            echo "- Next manual step: configure Email Routing catch-all for $ROOT_DOMAIN to this Worker"
+          } >> "$GITHUB_STEP_SUMMARY"
