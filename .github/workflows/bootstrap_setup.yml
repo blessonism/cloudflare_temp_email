@@ -113,6 +113,7 @@ jobs:
       - name: Build backend config
         shell: bash
         run: |
+          jwt_secret_clean=$(printf '%s' "$JWT_SECRET" | tr -d '\r\n')
           cat <<EOF | sed 's/^          //' > worker/wrangler.toml
           name = "$WORKER_NAME"
           main = "src/worker.ts"
@@ -127,7 +128,7 @@ jobs:
           PREFIX = "tmp"
           DEFAULT_DOMAINS = ["$ROOT_DOMAIN"]
           DOMAINS = ["$ROOT_DOMAIN"]
-          JWT_SECRET = "$JWT_SECRET"
+          JWT_SECRET = "$jwt_secret_clean"
           ENABLE_USER_CREATE_EMAIL = true
           ENABLE_USER_DELETE_EMAIL = true
           FRONTEND_URL = "https://${{ steps.meta.outputs.frontend_domain }}"
